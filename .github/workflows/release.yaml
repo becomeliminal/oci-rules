@@ -1,0 +1,52 @@
+# Publishes what changed on main, once its tests pass on Linux and macOS:
+# oci_tool when tools/oci_tool/VERSION has no release yet (tag
+# oci-tool-v<version>), then the plugin when VERSION has none (tag v<version>).
+# A version that already has a release is left as it is.
+name: Release
+
+on:
+  workflow_run:
+    workflows: [Test]
+    types: [completed]
+    branches: [main]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    if: github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+
+      # The binaries are the pinned ones or nothing is published: the test
+      # compares each build with tools/release.build_defs.
+      - name: Build oci_tool for every platform
+        run: |
+          ./pleasew test -p -v notice //package:release_hashes_test
+          ./pleasew build -p -v notice //package:oci_tool_release_files
+          mkdir -p dist/oci_tool
+          cp plz-out/gen/package/oci_tool-* dist/oci_tool/
+          shasum -a 256 dist/oci_tool/*
+
+      - name: Release oci_tool
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        uses: thought-machine/release-action@0dfdc6c2e233ff85c0e1ac9338e54081962d7ba6
+        with:
+          version-file: tools/oci_tool/VERSION
+          change-log-file: tools/oci_tool/ChangeLog
+          release-prefix: oci-tool
+          release-files: dist/oci_tool
+
+      - name: Release the plugin
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        uses: thought-machine/release-action@0dfdc6c2e233ff85c0e1ac9338e54081962d7ba6

@@ -1,0 +1,7 @@
+{
+  "schema_version": 1,
+  "media_type": "application/vnd.oci.image.layer.v1.tar+gzip",
+  "digest": "sha256:05591d331d930ea2a25e2c9b2c22838697d509e2b463b83ebbdd214af5006231",
+  "size": 177,
+  "diff_id": "sha256:dab6c0b3291641f3bdd0040898c590a188b016d84111c68dd68910c41d922de6"
+}

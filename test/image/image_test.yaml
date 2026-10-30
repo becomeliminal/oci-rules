@@ -1,0 +1,19 @@
+schemaVersion: 2.0.0
+
+metadataTest:
+  entrypoint: ["/bin/cat"]
+  cmd: ["/etc/greeting"]
+  envVars:
+    - key: LANG
+      value: C.UTF-8
+
+fileExistenceTests:
+  - name: the greeting, a plain readable file
+    path: /etc/greeting
+    shouldExist: true
+    permissions: "-rw-r--r--"
+
+fileContentTests:
+  - name: the greeting says hello
+    path: /etc/greeting
+    expectedContents: ["^hello, image\n$"]

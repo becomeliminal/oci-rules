@@ -1,0 +1,6 @@
+Version 0.1.0
+-------------
+    * First release: oci_layer, oci_pull, oci_import, oci_image,
+      oci_image_index, oci_layout, oci_archive, oci_load, oci_test, and
+      <image>_push, _sign and _verify. OciTool defaults to the released
+      oci_tool 0.1.0.

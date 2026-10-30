@@ -1,0 +1,57 @@
+# Runs every test on Linux and on macOS. The rules' build commands are shell
+# run on the user's machine, and BSD userland (macOS) differs from GNU in ways
+# a Linux-only run never sees. On macOS, test/platform also builds a Go binary
+# for linux/amd64, a real cross-build. On Linux, //package:release_hashes_test
+# checks that oci_tool built from this commit is byte for byte the pinned
+# release (package/BUILD says why it doesn't run on macOS yet).
+name: Test
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, macos-14]
+    runs-on: ${{ matrix.runner }}
+    name: test (${{ matrix.runner }})
+    steps:
+      - uses: actions/checkout@v4
+
+      # Please's sandbox runs build actions in unprivileged user namespaces,
+      # which Ubuntu 24.04's AppArmor refuses by default.
+      - name: Allow unprivileged user namespaces
+        if: runner.os == 'Linux'
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
+      - name: Test
+        run: ./pleasew test -p -v notice --log_file plz-out/log/test.log //...
+
+      # The release binaries this host built, to compare with the pins
+      # when //package:release_hashes_test fails.
+      - name: Archive oci_tool builds
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: oci_tool-${{ matrix.runner }}
+          path: plz-out/gen/package/oci_tool-*
+          if-no-files-found: ignore
+
+      - name: Archive logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-${{ matrix.runner }}
+          path: plz-out/log

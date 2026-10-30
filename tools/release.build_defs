@@ -1,0 +1,12 @@
+# The oci_tool release the plugin uses by default: its version and the sha256
+# of each platform's binary. //package builds these same bytes from source,
+# and //package:release_hashes_test fails if they differ, so the pins can
+# be written before the release exists and checked on every change.
+OCI_TOOL_VERSION = "0.1.0"
+
+OCI_TOOL_HASHES = {
+    "darwin_amd64": "4082d6463e567e22deb5c8b4570630d09f16ff01607b038e3fcd2af9b3f8fdbd",
+    "darwin_arm64": "be02bdb79a605c7eaf05471d39ee5190654e11cc8c8b72a8e134d10f1732dbea",
+    "linux_amd64": "7b913956abbafa94e572918c7c306fa02e0a1ae85577db73578f2f18360bf39e",
+    "linux_arm64": "79470b5c62b9faa69325d5a0bddd79484162b8770cc6c8ff5fbd1104fee5e0d2",
+}

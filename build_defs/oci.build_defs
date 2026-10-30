@@ -1,0 +1,1029 @@
+subinclude("///shell//build_defs:shell")
+
+"""Please rules for OCI images, built as ordinary build actions.
+
+`oci_layer` is a filesystem layer: declared files, directories and symlinks,
+written deterministically (sorted, epoch timestamps, numeric owners, fixed
+modes, a pinned gzip). Its two named outputs are `|blob`, the compressed layer
+a registry stores, and `|meta`, its digest, size and diff ID as JSON, which is
+all an image's config and manifest need.
+
+Every rule runs the plugin's `OciTool` with no network and no credentials:
+the action is sandboxed, and nothing it reads is outside what it declares.
+"""
+
+# The platforms a layer's built files can be built for, each to the
+# architecture subrepo that builds for it. A platform not here is refused.
+_ARCH_SUBREPOS = {
+    "linux/amd64": "linux_amd64",
+    "linux/arm64": "linux_arm64",
+}
+
+def _blob_name(name:str, extension:str):
+    """The file name of a blob output. An image's `_blobs` is a filegroup,
+    which places each file by its name, so two blobs of one name from
+    different packages would collide there: the name carries the package.
+    Nothing reads it; blobs are matched by their content's digest."""
+    package = package_name().replace("/", "_")
+    return f"{package}.{name}.{extension}"
+
+def _platform(rule:str, name:str, platform:str):
+    """The platform a rule is for: its own, else the plugin's DefaultPlatform,
+    else None. Either way it is one this plugin builds for."""
+    platform = platform or CONFIG.OCI.DEFAULT_PLATFORM
+    if platform and platform not in _ARCH_SUBREPOS:
+        fail(f"{rule} {name}: platform {platform} is not one of " + ", ".join(sorted(_ARCH_SUBREPOS.keys())))
+    return platform
+
+def _repository(rule:str, name:str, repository:str):
+    """A repository as a full reference. One whose first component is a
+    registry host (it holds a "." or a ":", or is localhost: Docker's own
+    rule) is used as given; any other is a short name in the plugin's
+    Registry, which must then be set."""
+    if not repository:
+        return None
+    if repository.startswith("/") or repository.endswith("/"):
+        fail(f"{rule} {name}: repository {repository} begins or ends with /")
+    host = repository.split("/")[0]
+    if "." in host or ":" in host or host == "localhost":
+        return repository
+    registry = CONFIG.OCI.REGISTRY
+    if not registry:
+        fail(f"{rule} {name}: repository {repository} is a short name, but the oci plugin's Registry is not set; set it, or give the full repository")
+    if registry.endswith("/"):
+        fail(f"{rule} {name}: the oci plugin's Registry {registry} ends with /")
+    return f"{registry}/{repository}"
+
+def oci_layer(
+        name:str,
+        files:dict={},
+        trees:dict={},
+        tars:list=[],
+        platform:str=None,
+        modes:dict={},
+        owners:dict={},
+        symlinks:dict={},
+        empty_dirs:list=[],
+        whiteouts:list=[],
+        opaque_dirs:list=[],
+        visibility:list=None,
+        test_only:bool=False,
+        tool:str=None):
+    """A deterministic OCI filesystem layer.
+
+    Args:
+      name: The rule's name.
+      files: Absolute image path to the build label (or file) placed there.
+        Each must produce exactly one file; select one with `|output`.
+      trees: Absolute image directory to a rule (a filegroup of data files,
+        say) whose every output is placed under that directory at its path
+        relative to the rule's package: `{"/data": "//docs:docs"}` puts
+        docs/faq/a.md at /data/faq/a.md, however many files the rule has.
+        Each file is written 0644, owned as `owners` says for the directory;
+        an executable belongs in `files`, with its mode. A file outside the
+        rule's package fails the build.
+      tars: Rules whose output is a tarball, plain or gzipped, each of whose
+        entries the layer holds as the tarball has it: its whole mode
+        (setuid, setgid and sticky bits included, as dpkg and apk install a
+        package's), owner and link target, with every time set to the epoch. This is how a layer
+        takes a filesystem another tool laid out (rules_oci's `tars`). A
+        directory several tarballs hold alike is written once; any other path
+        declared twice, a device, a name
+        that leaves the image root or a relative symlink target that climbs
+        above it fails the build, naming it. An absolute symlink target is
+        kept: it resolves against the image's own root. A hard link
+        becomes a copy of the file it links to.
+      platform: The platform the built files are for ("linux/amd64"). Each
+        build label in `files` is then built in that platform's architecture
+        subrepo (`///linux_amd64//pkg:target`), whatever the host: on a host
+        of that platform it is the same target, and on any other, a build
+        for it. An executable built for another platform is refused, naming
+        it. Unset, the plugin's DefaultPlatform; with neither, files come
+        from the host's build, and `oci_image` still refuses a binary that
+        isn't the image's platform.
+      modes: Image path to its permission bits, as an octal string ("0755").
+        A string, not a number: this BUILD language reads 0o755 as the
+        decimal 755. A file whose input is executable must be listed: an
+        input's executable bit differs between local and remote builds, so it
+        is never inherited. Files default to "0644", directories to "0755".
+      owners: Image path to `{"uid": int, "gid": int}`. Everything else is
+        owned by 0:0.
+      symlinks: Image path to the link target, written as given.
+      empty_dirs: Image paths of directories to create with nothing in them.
+      whiteouts: Image paths to delete, with everything under them, from the
+        layers below. The layer may not also add one of them or anything
+        inside it.
+      opaque_dirs: Image paths of directories whose contents from the layers
+        below are hidden; what this layer puts in them stays. Each is written
+        0755, owned 0:0.
+      visibility: Visibility of the rule.
+      test_only: If True, only tests may depend on it.
+      tool: The oci-tool to run, overriding the plugin's OciTool.
+    """
+    paths = files.keys() + trees.keys() + symlinks.keys() + empty_dirs + whiteouts + opaque_dirs
+    seen = {}
+    for p in paths:
+        if p in seen:
+            fail(f"oci_layer {name}: {p} is declared more than once across files, trees, symlinks, empty_dirs, whiteouts and opaque_dirs")
+        seen[p] = True
+    for p in modes.keys():
+        if p not in files and p not in empty_dirs:
+            fail(f"oci_layer {name}: modes names {p}, which is not one of its files or empty_dirs")
+        if not isinstance(modes[p], str):
+            fail(f"oci_layer {name}: modes[{p}] must be an octal string such as \"0755\", not {modes[p]}")
+    for p, owner in owners.items():
+        if p not in paths:
+            fail(f"oci_layer {name}: owners names {p}, which it does not declare")
+        if sorted(owner.keys()) != ["gid", "uid"]:
+            fail(f"oci_layer {name}: owners[{p}] must be exactly {{\"uid\": ..., \"gid\": ...}}")
+
+    platform = _platform("oci_layer", name, platform)
+    arch = _ARCH_SUBREPOS[platform] if platform else None
+
+    srcs = {}
+    entries = []
+    for i, p in enumerate(sorted(files.keys())):
+        group = f"f{i}"
+        src = files[p]
+
+        # A build label, not a file or a label already in a subrepo, is built
+        # for the layer's platform.
+        if arch and (src.startswith("//") or src.startswith(":")) and not src.startswith("///"):
+            src = f"///{arch}" + canonicalise(src)
+        srcs[group] = [src]
+        entry = {"path": p, "kind": "file", "source": group}
+        if p in modes:
+            entry["mode"] = modes[p]
+        entries.append(_owned(entry, owners.get(p)))
+    for i, p in enumerate(sorted(trees.keys())):
+        if not p.startswith("/") or p == "/":
+            fail(f"oci_layer {name}: trees names {p}; a tree is placed under an absolute directory other than /")
+        group = f"t{i}"
+        src = canonicalise(trees[p])
+        srcs[group] = [src]
+
+        # Each file's path relative to the rule's package is its place under
+        # the directory.
+        package = src.removeprefix("//").split(":")[0]
+        entries.append(_owned({"path": p, "kind": "tree", "source": group, "strip": package}, owners.get(p)))
+    for i, tar in enumerate(tars):
+        group = f"x{i}"
+        srcs[group] = [tar]
+        entries.append({"path": "/", "kind": "tar", "source": group, "uid": 0, "gid": 0})
+    for p in sorted(symlinks.keys()):
+        entries.append(_owned({"path": p, "kind": "symlink", "target": symlinks[p]}, owners.get(p)))
+    for p in sorted(empty_dirs):
+        entry = {"path": p, "kind": "dir"}
+        if p in modes:
+            entry["mode"] = modes[p]
+        entries.append(_owned(entry, owners.get(p)))
+    for p in sorted(whiteouts):
+        if p in owners:
+            fail(f"oci_layer {name}: owners names {p}, a whiteout, which has no owner")
+        entries.append({"path": p, "kind": "whiteout", "uid": 0, "gid": 0})
+    for p in sorted(opaque_dirs):
+        if p in owners:
+            fail(f"oci_layer {name}: owners names {p}, an opaque directory, which is 0755 and owned 0:0")
+        entries.append({"path": p, "kind": "opaque", "uid": 0, "gid": 0})
+    if not entries:
+        fail(f"oci_layer {name}: declares nothing; give it files, trees, tars, symlinks, empty_dirs, whiteouts or opaque_dirs")
+
+    layer_spec = {"entries": entries}
+    if platform:
+        layer_spec["platform"] = platform
+    text = json(layer_spec)
+    spec = genrule(
+        name = f"_{name}#spec",
+        outs = [f"{name}.spec.json"],
+        cmd = f"cat > $OUT <<'PLZ_OCI_JSON'\n{text}\nPLZ_OCI_JSON",
+        test_only = test_only,
+    )
+    srcs["spec"] = [spec]
+
+    return build_rule(
+        name = name,
+        srcs = srcs,
+        outs = {
+            "blob": [_blob_name(name, "tar.gz")],
+            "meta": [f"{name}.layer.json"],
+        },
+        cmd = "$TOOL layer --spec $SRCS_SPEC --blob $OUTS_BLOB --meta $OUTS_META",
+        labels = ["oci_layer"],
+        sandbox = True,
+        test_only = test_only,
+        tools = [tool or CONFIG.OCI.OCI_TOOL],
+        visibility = visibility,
+    )
+
+def _owned(entry:dict, owner:dict):
+    if owner:
+        entry["uid"] = owner["uid"]
+        entry["gid"] = owner["gid"]
+    else:
+        entry["uid"] = 0
+        entry["gid"] = 0
+    return entry
+
+def oci_pull(
+        name:str,
+        image:str,
+        digest:str,
+        platform:str=None,
+        visibility:list=None,
+        test_only:bool=False,
+        tool:str=None):
+    """A public base image, pulled by digest as rules_oci's oci.pull pulls one.
+
+    One `oci-tool pull` action fetches the document at the digest (an image's
+    manifest, or an index to take the platform's image from), then that
+    image's config and layers, through the registry's token handshake,
+    anonymously: no credential is in it, so only a public image can be
+    pulled. Every byte is checked against the digest that names it. The
+    action has the network, as a `remote_file` does, so it is not sandboxed,
+    and its output is an OCI image layout in plz-out, which `oci_import`
+    reads. Nothing is committed but the digest: a build never resolves a tag,
+    and taking a newer image is changing the digest in a reviewed PR.
+
+    Outputs, as `oci_import`'s: `|base`, which `oci_image` builds on, and
+    `:<name>_blobs`, its layers' blobs; and `:<name>_layout`, the pulled
+    layout, for a rule that reads the base's files.
+
+    Args:
+      name: The rule's name.
+      image: The image's repository: docker.io/library/postgres,
+        ghcr.io/actions/actions-runner.
+      digest: Its digest, sha256:<hex>, of an image or of an index.
+      platform: The image to take; unset, the plugin's DefaultPlatform, and
+        with neither the build fails.
+      visibility: Visibility of the rule.
+      test_only: If True, only tests may depend on it.
+      tool: The oci-tool to run, overriding the plugin's OciTool.
+    """
+    platform = _platform("oci_pull", name, platform)
+    if not platform:
+        fail(f"oci_pull {name}: no platform; give it one, or set the oci plugin's DefaultPlatform")
+    if not digest.startswith("sha256:") or len(digest) != len("sha256:") + 64:
+        fail(f"oci_pull {name}: digest {digest} is not sha256:<hex>; pull by digest, never by tag")
+    if "@" in image or ":" in image.split("/")[-1]:
+        fail(f"oci_pull {name}: image {image} names a tag or digest; give the repository, and the digest separately")
+    layout = build_rule(
+        name = f"_{name}#layout",
+        outs = [f"{name}_layout"],
+        cmd = f"$TOOL pull --image {image} --digest {digest} --platform {platform} --out $OUT",
+        # It fetches the image from its registry, as a remote_file fetches a
+        # URL, so it has the network.
+        sandbox = False,
+        test_only = test_only,
+        tools = [tool or CONFIG.OCI.OCI_TOOL],
+    )
+
+    # The layout itself, for a rule or test that reads the base's
+    # filesystem.
+    filegroup(
+        name = f"{name}_layout",
+        srcs = [layout],
+        test_only = test_only,
+        visibility = visibility,
+    )
+    return oci_import(
+        name = name,
+        layout = layout,
+        platform = platform,
+        test_only = test_only,
+        tool = tool,
+        visibility = visibility,
+    )
+
+def oci_import(
+        name:str,
+        layout:str,
+        platform:str=None,
+        visibility:list=None,
+        test_only:bool=False,
+        tool:str=None):
+    """A base from an OCI image layout another rule builds: apko's, say, or
+    any tool that writes one. `oci_image` builds on it as on an `oci_pull`.
+
+    The layout must hold exactly one image for the platform, in its index or
+    an index below it, and every blob is checked against its digest; its
+    layers must be gzipped tars. A build action, like every other: what
+    reaches the layout is the producing rule's business, and this reads only
+    what it wrote.
+
+    Outputs: `|base`, the base's metadata, and `:<name>_blobs`, its layers'
+    blobs, a directory of files named by digest.
+
+    Args:
+      name: The rule's name.
+      layout: A rule whose output is an OCI image layout directory.
+      platform: The image to take from it; unset, the plugin's
+        DefaultPlatform, and with neither the build fails.
+      visibility: Visibility of the rule.
+      test_only: If True, only tests may depend on it.
+      tool: The oci-tool to run, overriding the plugin's OciTool.
+    """
+    platform = _platform("oci_import", name, platform)
+    if not platform:
+        fail(f"oci_import {name}: no platform; give it one, or set the oci plugin's DefaultPlatform")
+    rule = build_rule(
+        name = name,
+        srcs = {"layout": [layout]},
+        outs = {
+            "base": [f"{name}.base.json"],
+            "blobs": [_blob_name(name, "blobs")],
+        },
+        cmd = f"$TOOL import --layout $SRCS_LAYOUT --platform {platform} --base $OUTS_BASE --blobs $OUTS_BLOBS",
+        labels = ["oci_base"],
+        sandbox = True,
+        test_only = test_only,
+        tools = [tool or CONFIG.OCI.OCI_TOOL],
+        visibility = visibility,
+    )
+    filegroup(
+        name = f"{name}_blobs",
+        srcs = [f":{name}|blobs"],
+        test_only = test_only,
+        visibility = visibility,
+    )
+    return rule
+
+def oci_image(
+        name:str,
+        platform:str=None,
+        base:str=None,
+        layers:list=[],
+        entrypoint:list=None,
+        cmd:list=None,
+        env:dict={},
+        user:str=None,
+        workdir:str=None,
+        stop_signal:str=None,
+        repository:str=None,
+        visibility:list=None,
+        test_only:bool=False,
+        tool:str=None):
+    """An OCI image: layers over a base, identified by its manifest digest.
+
+    Named outputs: `|manifest`, `|config`, `|meta` (descriptors, as JSON) and
+    `|digest` (the manifest's sha256), and `|base`, the image as another's
+    base. With `repository`, also `|fqn`, the
+    image's reference by digest (`<repository>@sha256:...`), which
+    `:<name>_fqn` exposes for a deploy to substitute. The digest
+    is the identity: no tag, version or label stands in for it, so anything
+    that changes the image changes it. `:<name>_blobs` is every layer blob,
+    base's and own, for publishing and layouts.
+
+    Args:
+      name: The rule's name.
+      platform: linux/amd64 or linux/arm64. A check against the base and the
+        layers' inputs, never a conversion. Unset, the plugin's
+        DefaultPlatform; with neither, the build fails.
+      base: An `oci_pull`, an `oci_import`, or another `oci_image`, whose
+        layers come first and whose config this image's settings apply
+        over; nothing builds from scratch. Its platform must be the image's.
+      layers: `oci_layer` targets, bottom first.
+      entrypoint: The entrypoint; None inherits the base's, [] clears it.
+        Setting it without `cmd` clears an inherited cmd.
+      cmd: The command; None inherits, [] clears.
+      env: Values set over the base's environment, key by key.
+      user: The user to run as; None inherits.
+      workdir: The working directory, absolute; None inherits.
+      stop_signal: The signal a runtime stops the container with
+        ("SIGQUIT", say, for nginx's graceful stop); None inherits.
+      repository: The registry repository the image is published to, with
+        no tag or digest: a full one (`registry.example.com/team/app`), or a
+        short name (`app`) in the plugin's Registry.
+      visibility: Visibility of the rule.
+      test_only: If True, only tests may depend on it.
+      tool: The oci-tool to run, overriding the plugin's OciTool.
+    """
+    platform = _platform("oci_image", name, platform)
+    if not platform:
+        fail(f"oci_image {name}: no platform; give it one, or set the oci plugin's DefaultPlatform")
+    repository = _repository("oci_image", name, repository)
+    spec = {"platform": platform}
+    if entrypoint != None:
+        spec["entrypoint"] = entrypoint
+    if cmd != None:
+        spec["cmd"] = cmd
+    if env:
+        spec["env"] = env
+    if user != None:
+        spec["user"] = user
+    if workdir != None:
+        spec["workdir"] = workdir
+    if stop_signal != None:
+        spec["stop_signal"] = stop_signal
+    if repository:
+        # In the spec, never on the command line: a value from a BUILD file
+        # reaches the tool through a quoted heredoc and is never shell text.
+        spec["repository"] = repository
+    text = json(spec)
+    spec_file = genrule(
+        name = f"_{name}#spec",
+        outs = [f"{name}.image_spec.json"],
+        cmd = f"cat > $OUT <<'PLZ_OCI_JSON'\n{text}\nPLZ_OCI_JSON",
+        test_only = test_only,
+    )
+
+    srcs = {"spec": [spec_file]}
+    flags = ""
+    blobs = []
+    if base:
+        base = canonicalise(base)
+        srcs["base"] = [base + "|base"]
+        flags += " --base $SRCS_BASE"
+        blobs += [base + "_blobs"]
+    for i, layer in enumerate(layers):
+        layer = canonicalise(layer)
+        srcs[f"l{i}"] = [layer + "|meta"]
+        flags += f" --layer $SRCS_L{i}"
+        blobs += [layer + "|blob"]
+    outs = {
+        "base": [f"{name}.image_base.json"],
+        "config": [f"{name}.config.json"],
+        "digest": [f"{name}.digest"],
+        "manifest": [f"{name}.manifest.json"],
+        "meta": [f"{name}.image.json"],
+    }
+    if repository:
+        outs["fqn"] = [f"{name}.fqn"]
+        outs["retain"] = [f"{name}.retain"]
+        flags += " --fqn $OUTS_FQN --retain $OUTS_RETAIN"
+
+    image = build_rule(
+        name = name,
+        srcs = srcs,
+        outs = outs,
+        cmd = "$TOOL image --spec $SRCS_SPEC --config $OUTS_CONFIG --manifest $OUTS_MANIFEST --meta $OUTS_META --digest $OUTS_DIGEST --base-out $OUTS_BASE" + flags,
+        labels = ["oci_image"],
+        sandbox = True,
+        test_only = test_only,
+        tools = [tool or CONFIG.OCI.OCI_TOOL],
+        visibility = visibility,
+    )
+    filegroup(
+        name = f"{name}_blobs",
+        srcs = blobs,
+        test_only = test_only,
+        visibility = visibility,
+    )
+    if repository:
+        filegroup(
+            name = f"{name}_fqn",
+            srcs = [f":{name}|fqn"],
+            test_only = test_only,
+            visibility = visibility,
+        )
+        filegroup(
+            name = f"{name}_retain",
+            srcs = [f":{name}|retain"],
+            test_only = test_only,
+            visibility = visibility,
+        )
+
+        _publisher(name, f":{name}", tool or CONFIG.OCI.OCI_TOOL, test_only, visibility)
+        _signer(name, [f":{name}"], None, tool or CONFIG.OCI.OCI_TOOL, test_only, visibility)
+    return image
+
+def oci_image_index(
+        name:str,
+        images:list,
+        repository:str=None,
+        visibility:list=None,
+        test_only:bool=False,
+        tool:str=None):
+    """A multi-platform image: an OCI image index over one `oci_image` per
+    platform, identified by the index's digest.
+
+    The children are sorted by platform, so their order here doesn't change
+    the index. Two images of one platform, an index as a child, and fewer
+    than two images are refused. Named outputs: `|index` (the document),
+    `|meta` and `|digest`, and with `repository`, `|fqn` and `|retain`, which
+    `:<name>_fqn` and `:<name>_retain` expose as an image's do: a manifest
+    names the index, and a runtime picks its platform.
+
+    `:<name>_push` publishes every child into `repository` by digest, each
+    with its own retention tag so a registry's cleanup of untagged
+    manifests can't take it from under the index, then the index and its
+    tag. No retention tag is moved: one that names another digest stops the
+    publish before anything is written.
+
+    Args:
+      name: The rule's name.
+      images: `oci_image` targets, one per platform.
+      repository: The registry repository the index and its children are
+        published to, full or a short name in the plugin's Registry, as an
+        `oci_image`'s.
+      visibility: Visibility of the rule.
+      test_only: If True, only tests may depend on it.
+      tool: The oci-tool to run, overriding the plugin's OciTool.
+    """
+    if len(images) < 2:
+        fail(f"oci_image_index {name}: an index is of at least two platforms; give two or more images")
+    images = [canonicalise(i) for i in images]
+    repository = _repository("oci_image_index", name, repository)
+    spec = {}
+    if repository:
+        spec["repository"] = repository
+    text = json(spec)
+    spec_file = genrule(
+        name = f"_{name}#index_spec",
+        outs = [f"{name}.index_spec.json"],
+        cmd = f"cat > $OUT <<'PLZ_OCI_JSON'\n{text}\nPLZ_OCI_JSON",
+        test_only = test_only,
+    )
+    srcs = {"spec": [spec_file]}
+    flags = ""
+    for i, img in enumerate(images):
+        srcs[f"c{i}"] = [img + "|meta"]
+        flags += f" --child $SRCS_C{i}"
+    outs = {
+        "digest": [f"{name}.digest"],
+        "index": [f"{name}.index.json"],
+        "meta": [f"{name}.index_meta.json"],
+    }
+    if repository:
+        outs["fqn"] = [f"{name}.fqn"]
+        outs["retain"] = [f"{name}.retain"]
+        flags += " --fqn $OUTS_FQN --retain $OUTS_RETAIN"
+    index = build_rule(
+        name = name,
+        srcs = srcs,
+        outs = outs,
+        cmd = "$TOOL index --spec $SRCS_SPEC --index $OUTS_INDEX --meta $OUTS_META --digest $OUTS_DIGEST" + flags,
+        labels = ["oci_image_index"],
+        sandbox = True,
+        test_only = test_only,
+        tools = [tool or CONFIG.OCI.OCI_TOOL],
+        visibility = visibility,
+    )
+    filegroup(
+        name = f"{name}_blobs",
+        srcs = [img + "_blobs" for img in images],
+        test_only = test_only,
+        visibility = visibility,
+    )
+    if not repository:
+        return index
+    for output in ["fqn", "retain"]:
+        filegroup(
+            name = f"{name}_{output}",
+            srcs = [f":{name}|{output}"],
+            test_only = test_only,
+            visibility = visibility,
+        )
+    filegroup(
+        name = f"_{name}#index",
+        srcs = [f":{name}|index"],
+        test_only = test_only,
+    )
+
+    # Each child's manifest and config, in the same order, as their own
+    # filegroups: $(out_location) reads "|" as an entry point.
+    tool_label = tool or CONFIG.OCI.OCI_TOOL
+    files = [f":_{name}#index", f":{name}_fqn", f":{name}_retain", f":{name}_blobs", tool_label]
+    child_flags = []
+    for i, img in enumerate(images):
+        for output in ["manifest", "config"]:
+            filegroup(
+                name = f"_{name}#c{i}_{output}",
+                srcs = [f"{img}|{output}"],
+                test_only = test_only,
+            )
+            files.append(f":_{name}#c{i}_{output}")
+            child_flags.append(f"--child-{output} $(out_location :_{name}#c{i}_{output})")
+    sh_cmd(
+        name = f"{name}_push",
+        cmd = " ".join([
+            f"$(out_exe {tool_label}) push-index",
+            f"--index $(out_location :_{name}#index)",
+            f"--fqn $(out_location :{name}_fqn)",
+            f"--retain $(out_location :{name}_retain)",
+        ] + child_flags + [
+            f"$(for b in $(out_locations :{name}_blobs); do printf -- '--blob %s ' \"$b\"; done)",
+        ]),
+        data = files,
+        labels = ["oci_push"],
+        test_only = test_only,
+        visibility = visibility,
+        deps = files,
+    )
+    _signer(name, images, f":_{name}#index", tool_label, test_only, visibility)
+    return index
+
+def _signer(name:str, images:list, index:str, tool_label:str, test_only:bool, visibility:list):
+    """Defines `<name>_sign` and `<name>_verify` for an image, or for an index
+    and its children, when the plugin's CosignTool and SyftTool are set.
+
+    `plz run :<name>_sign -- --source-uri ... --commit ... --builder-id ...
+    --invocation-id ...` signs the published digest of each image and attaches
+    its SPDX SBOM and SLSA provenance, then signs the index. The source flags
+    are given at run time by what deploys, never invented here. `<name>_verify`
+    checks each signature and attestation against the plugin's VerifyPublicKey,
+    or its VerifyIdentity and VerifyIssuer. Both are runtime operations, run
+    after the push; the image itself never changes.
+    """
+    if not CONFIG.OCI.COSIGN_TOOL:
+        return
+    if not CONFIG.OCI.SYFT_TOOL:
+        fail(f"{name}: the oci plugin's CosignTool is set but SyftTool isn't; signing attaches an SBOM, which needs syft")
+    if not CONFIG.OCI.PROVENANCE_BUILD_TYPE:
+        fail(f"{name}: the oci plugin's CosignTool is set but ProvenanceBuildType isn't; signing attaches provenance, which names its build type")
+    settings = {"build_type": CONFIG.OCI.PROVENANCE_BUILD_TYPE}
+    for key, value in [
+        ("key", CONFIG.OCI.SIGNING_KEY),
+        ("public_key", CONFIG.OCI.VERIFY_PUBLIC_KEY),
+        ("identity", CONFIG.OCI.VERIFY_IDENTITY),
+        ("issuer", CONFIG.OCI.VERIFY_ISSUER),
+    ]:
+        if value:
+            settings[key] = value
+    text = json(settings)
+    spec_file = genrule(
+        name = f"_{name}#sign_spec",
+        outs = [f"{name}.sign_spec.json"],
+        cmd = f"cat > $OUT <<'PLZ_OCI_JSON'\n{text}\nPLZ_OCI_JSON",
+        test_only = test_only,
+    )
+    files = [spec_file, f":{name}_fqn", tool_label, CONFIG.OCI.COSIGN_TOOL, CONFIG.OCI.SYFT_TOOL]
+    if index:
+        files.append(index)
+    sign_flags = []
+    verify_flags = []
+    for i, img in enumerate(images):
+        meta = filegroup(
+            name = f"_{name}#sign_meta{i}",
+            srcs = [img + "|meta"],
+            test_only = test_only,
+        )
+        layout = _archive_rule(
+            name = f"_{name}_sign{i}",
+            out = f"{name}.sign_layout{i}",
+            image = img,
+            spec = {"format": "oci"},
+            subcommand = "layout",
+            tag = "layout",
+            test_only = test_only,
+        )
+        files += [meta, layout]
+        if index:
+            sign_flags.append(f"--child-meta $(out_location {meta}) --child-layout $(out_location {layout})")
+            verify_flags.append(f"--child-meta $(out_location {meta})")
+        else:
+            sign_flags.append(f"--layout $(out_location {layout}) --meta $(out_location {meta})")
+    ref_flag = f"--index $(out_location {index}) --index-ref" if index else "--ref"
+    common = f"--spec $(out_location {spec_file}) {ref_flag} $(out_location :{name}_fqn) --cosign $(out_exe {CONFIG.OCI.COSIGN_TOOL})"
+    target = canonicalise(f":{name}")
+    sh_cmd(
+        name = f"{name}_sign",
+        cmd = " ".join([f"$(out_exe {tool_label}) sign", common] + sign_flags + [
+            f"--target {target}",
+            f"--syft $(out_exe {CONFIG.OCI.SYFT_TOOL})",
+            '"\\\\$@"',
+        ]),
+        data = files,
+        labels = ["oci_sign"],
+        test_only = test_only,
+        visibility = visibility,
+        deps = files,
+    )
+    sh_cmd(
+        name = f"{name}_verify",
+        cmd = " ".join([f"$(out_exe {tool_label}) verify", common] + verify_flags + ['"\\\\$@"']),
+        data = files,
+        labels = ["oci_verify"],
+        test_only = test_only,
+        visibility = visibility,
+        deps = files,
+    )
+
+def _publisher(name:str, image:str, tool_label:str, test_only:bool, visibility:list):
+    """Defines `<name>_push`, which publishes `image`, an `oci_image` with a
+    repository.
+
+    A runtime operation, never a build action. It uploads the bytes the build
+    made (missing blobs, the manifest by digest, then the retention tag) with
+    the caller's registry credentials, and refuses a retention tag that names
+    another image. Its files are data as well as deps, so a remote build
+    leaves them where the script runs. It is always its own sh_cmd, never an
+    alias of another: `plz run` of a filegroup over an sh_cmd does not bring
+    that sh_cmd's data down, so under remote execution an alias finds no tool.
+    """
+
+    # $(out_location) reads "|" as an entry point, so each named output it
+    # needs is its own filegroup.
+    for output in ["manifest", "config"]:
+        filegroup(
+            name = f"_{name}#{output}",
+            srcs = [f"{image}|{output}"],
+            test_only = test_only,
+        )
+    files = [f":_{name}#manifest", f":_{name}#config", f"{image}_fqn", f"{image}_retain", f"{image}_blobs", tool_label]
+    sh_cmd(
+        name = f"{name}_push",
+        cmd = " ".join([
+            f"$(out_exe {tool_label}) push",
+            f"--manifest $(out_location :_{name}#manifest)",
+            f"--config $(out_location :_{name}#config)",
+            f"--fqn $(out_location {image}_fqn)",
+            f"--retain $(out_location {image}_retain)",
+            f"$(for b in $(out_locations {image}_blobs); do printf -- '--blob %s ' \"$b\"; done)",
+        ]),
+        data = files,
+        labels = ["oci_push"],
+        test_only = test_only,
+        visibility = visibility,
+        deps = files,
+    )
+
+# What oci_archive writes.
+_ARCHIVE_FORMATS = [
+    "docker",
+    "oci",
+]
+
+def oci_archive(
+        name:str,
+        image:str,
+        format:str="oci",
+        tags:list=[],
+        ref_name:str=None,
+        visibility:list=None,
+        test_only:bool=False,
+        tool:str=None):
+    """An `oci_image` as one file, for tools that read an archive rather than
+    a registry.
+
+    `format = "oci"` is the image's OCI image layout (`oci_layout`) as a tar;
+    `ref_name` names it in the layout's index. `format = "docker"` is a
+    Docker archive, what `docker load` and container-structure-test's tar
+    driver read: it loads as each of `tags`, at least one, each a complete
+    reference. Either is a build output, the same bytes for the same image
+    on any host.
+
+    Args:
+      name: The rule's name.
+      image: An `oci_image`.
+      format: "oci" or "docker".
+      tags: A Docker archive's tags; an OCI archive takes none.
+      ref_name: An OCI archive's ref.name; a Docker archive takes none.
+      visibility: Visibility of the rule.
+      test_only: If True, only tests may depend on it.
+      tool: The oci-tool to run, overriding the plugin's OciTool.
+    """
+    if format not in _ARCHIVE_FORMATS:
+        fail(f"oci_archive {name}: format {format} is not one of " + ", ".join(_ARCHIVE_FORMATS))
+    if format == "docker" and not tags:
+        fail(f"oci_archive {name}: a Docker archive loads as at least one tag; give tags")
+    if format == "docker" and ref_name:
+        fail(f"oci_archive {name}: a Docker archive names its image by tags, not ref_name")
+    if format == "oci" and tags:
+        fail(f"oci_archive {name}: an OCI archive names its image by ref_name, not tags")
+    spec = {"format": format}
+    if tags:
+        spec["tags"] = tags
+    if ref_name:
+        spec["ref_name"] = ref_name
+    return _archive_rule(
+        name = name,
+        out = f"{name}.tar",
+        image = canonicalise(image),
+        spec = spec,
+        test_only = test_only,
+        tool = tool,
+        visibility = visibility,
+    )
+
+def oci_layout(
+        name:str,
+        image:str,
+        ref_name:str=None,
+        visibility:list=None,
+        test_only:bool=False,
+        tool:str=None):
+    """An `oci_image` as an OCI image layout directory: `oci-layout`,
+    `index.json` naming the image (as `ref_name`, when given), and every blob
+    under `blobs/sha256`. The layout is read back and validated before it is
+    an output: every digest and size, and every layer's diff ID.
+
+    Args:
+      name: The rule's name.
+      image: An `oci_image`.
+      ref_name: The index entry's org.opencontainers.image.ref.name.
+      visibility: Visibility of the rule.
+      test_only: If True, only tests may depend on it.
+      tool: The oci-tool to run, overriding the plugin's OciTool.
+    """
+    spec = {"format": "oci"}
+    if ref_name:
+        spec["ref_name"] = ref_name
+    return _archive_rule(
+        name = name,
+        out = name,
+        image = canonicalise(image),
+        spec = spec,
+        subcommand = "layout",
+        test_only = test_only,
+        tool = tool,
+        visibility = visibility,
+    )
+
+def _archive_rule(
+        name:str,
+        image:str,
+        spec:dict,
+        out:str,
+        tag:str=None,
+        tag_files:list=[],
+        subcommand:str="archive",
+        visibility:list=None,
+        test_only:bool=False,
+        tool:str=None):
+    """The build action that writes an image as an archive or a layout. The
+    spec reaches the tool as a file through a quoted heredoc, so no value
+    from a BUILD file is ever shell text."""
+    rule_name = f"_{name}#{tag}" if tag else name
+    text = json(spec)
+    spec_file = genrule(
+        name = f"_{name}#{subcommand}_spec",
+        outs = [f"{name}.{subcommand}_spec.json"],
+        cmd = f"cat > $OUT <<'PLZ_OCI_JSON'\n{text}\nPLZ_OCI_JSON",
+        test_only = test_only,
+    )
+    srcs = {
+        "spec": [spec_file],
+        "manifest": [image + "|manifest"],
+        "config": [image + "|config"],
+        "blobs": [image + "_blobs"],
+    }
+    tag_flags = ""
+    for i, f in enumerate(tag_files):
+        srcs[f"tag{i}"] = [f]
+        tag_flags += f" --tag-file $SRCS_TAG{i}"
+    return build_rule(
+        name = name,
+        tag = tag,
+        srcs = srcs,
+        outs = [out],
+        cmd = f"$TOOL {subcommand} --spec $SRCS_SPEC --manifest $SRCS_MANIFEST --config $SRCS_CONFIG --out $OUT{tag_flags} $(for b in $SRCS_BLOBS; do printf -- '--blob %s ' \"$b\"; done)",
+        labels = [f"oci_{subcommand}"],
+        sandbox = True,
+        test_only = test_only,
+        tools = [tool or CONFIG.OCI.OCI_TOOL],
+        visibility = visibility,
+    )
+
+def oci_test(
+        name:str,
+        image:str,
+        configs:list=[],
+        owners:dict={},
+        user:str=None,
+        visibility:list=None,
+        tool:str=None):
+    """Tests an `oci_image` without running it, and with no Docker daemon.
+
+    `configs` are container-structure-test files (schemaVersion 2.0.0), run
+    with its tar driver against the image as a Docker archive: file
+    existence, file content, permissions and metadata. The tar driver
+    extracts files as whoever runs the test, so it can't tell who owns a
+    path; `owners` checks that instead, against the image's flattened
+    filesystem: `{"/app": {"uid": 0, "gid": 0}}`. container-structure-test
+    also reads an empty expected user as "don't check"; `user` is the
+    config's user exactly, `""` for none. A binary's platform needs
+    no test here: `oci_image` already refuses one that isn't its own.
+
+    Args:
+      name: The test's name.
+      image: An `oci_image`.
+      configs: container-structure-test config files.
+      owners: Absolute image path to `{"uid": int, "gid": int}`.
+      user: The config's user, exactly; "" asserts that none is set.
+      visibility: Visibility of the rule.
+      tool: The oci-tool to run, overriding the plugin's OciTool.
+    """
+    if not configs and not owners and user == None:
+        fail(f"oci_test {name}: tests nothing; give it configs, owners or a user")
+    image = canonicalise(image)
+    tool_label = tool or CONFIG.OCI.OCI_TOOL
+    data = {}
+    steps = []
+    if configs:
+        if not CONFIG.OCI.STRUCTURE_TEST_TOOL:
+            fail(f"oci_test {name}: configs need the oci plugin's StructureTestTool, a container-structure-test executable")
+        archive = _archive_rule(
+            name = name,
+            out = f"{name}.tar",
+            image = image,
+            spec = {"format": "docker", "tags": ["oci-test.invalid/image:test"]},
+            tag = "archive",
+            test_only = True,
+            tool = tool,
+        )
+        data["archive"] = [archive]
+        data["configs"] = configs
+        data["cst"] = [CONFIG.OCI.STRUCTURE_TEST_TOOL]
+        steps.append("HOME=$TMP_DIR DOCKER_HOST=unix:///oci-test-has-no-docker $DATA_CST test --driver tar --image $DATA_ARCHIVE $(for c in $DATA_CONFIGS; do printf -- '--config %s ' \"$c\"; done)")
+    if owners or user != None:
+        for p, owner in owners.items():
+            if sorted(owner.keys()) != ["gid", "uid"]:
+                fail(f"oci_test {name}: owners[{p}] must be exactly {{\"uid\": ..., \"gid\": ...}}")
+        check = {}
+        if owners:
+            check["owners"] = owners
+        if user != None:
+            check["user"] = user
+        text = json(check)
+        spec = genrule(
+            name = f"_{name}#check_spec",
+            outs = [f"{name}.check_spec.json"],
+            cmd = f"cat > $OUT <<'PLZ_OCI_JSON'\n{text}\nPLZ_OCI_JSON",
+            test_only = True,
+        )
+        data["check_spec"] = [spec]
+        data["manifest"] = [image + "|manifest"]
+        data["config"] = [image + "|config"]
+        data["blobs"] = [image + "_blobs"]
+        data["oci_tool"] = [tool_label]
+        steps.append("$DATA_OCI_TOOL check --spec $DATA_CHECK_SPEC --manifest $DATA_MANIFEST --config $DATA_CONFIG $(for b in $DATA_BLOBS; do printf -- '--blob %s ' \"$b\"; done)")
+    return gentest(
+        name = name,
+        data = data,
+        labels = ["oci_test"],
+        no_test_output = True,
+        test_cmd = " && ".join(steps),
+        visibility = visibility,
+    )
+
+# How each loader takes a Docker archive. A loader not here is refused, never
+# guessed at: a misspelt one would otherwise load into nothing.
+_LOADERS = {
+    "docker": "docker load --input",
+    "minikube": "minikube image load",
+}
+
+def oci_load(
+        name:str,
+        image:str,
+        loader:str="docker",
+        visibility:list=None,
+        test_only:bool=False,
+        tool:str=None):
+    """Loads an `oci_image` into a local container runtime, under its
+    retention tag.
+
+    `plz run :<name>` loads it. The archive it loads is a build output like
+    any other: deterministic, and written without a daemon.
+    A local runtime cannot hold an image by digest alone, so the image loads
+    as its retention tag (`<repository>:keep-sha256-<hex>`), which names exactly
+    one image. `:<name>_fqn` is that tag, for a manifest to run, and
+    `:<name>_retain` is the same. `:<name>_push` publishes the image as its
+    own `_push` does, so a deploy that publishes every image it runs
+    publishes this one under the same tag.
+
+    Args:
+      name: The rule's name.
+      image: An `oci_image` with a `repository`.
+      loader: What to load it into: "docker" (`docker load`) or "minikube"
+        (`minikube image load`, whatever runtime the cluster uses).
+      visibility: Visibility of the rule.
+      test_only: If True, only tests may depend on it.
+      tool: The oci-tool to run, overriding the plugin's OciTool.
+    """
+    if loader not in _LOADERS:
+        fail(f"oci_load {name}: loader {loader} is not one of " + ", ".join(sorted(_LOADERS.keys())))
+    image = canonicalise(image)
+    tag = image + "_retain"
+    archive = _archive_rule(
+        name = name,
+        out = f"{name}.tar",
+        image = image,
+        spec = {"format": "docker"},
+        tag = "archive",
+        tag_files = [tag],
+        test_only = test_only,
+        tool = tool,
+    )
+    filegroup(
+        name = f"{name}_fqn",
+        srcs = [tag],
+        test_only = test_only,
+        visibility = visibility,
+    )
+    filegroup(
+        name = f"{name}_retain",
+        srcs = [tag],
+        test_only = test_only,
+        visibility = visibility,
+    )
+    _publisher(name, image, tool or CONFIG.OCI.OCI_TOOL, test_only, visibility)
+    return sh_cmd(
+        name = name,
+        cmd = _LOADERS[loader] + " $(out_location " + archive + ")",
+        data = [archive],
+        labels = ["oci_load"],
+        test_only = test_only,
+        visibility = visibility,
+        deps = [archive],
+    )

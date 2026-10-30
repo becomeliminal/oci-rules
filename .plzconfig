@@ -1,0 +1,102 @@
+[Please]
+Version = >=17.31.2
+
+[build]
+hashcheckers = sha256
+
+[parse]
+preloadsubincludes = ///go//build_defs:go
+preloadsubincludes = ///shell//build_defs:shell
+
+; The plugins this repository builds and tests with. The oci plugin itself
+; needs only shell-rules; go-rules builds oci_tool and the tests' Go binaries.
+[Plugin "go"]
+Target = //plugins:go
+GoTool = //third_party/go:toolchain|go
+Stdlib = //third_party/go:std
+ImportPath = github.com/becomeliminal/oci-rules
+CgoEnabled = false
+
+[Plugin "shell"]
+Target = //plugins:shell
+
+; The plugin under test, configured as a user would. OciTool builds the tool
+; from this checkout, so every test runs the code it ships with; a user's
+; OciTool defaults to the released binary (//tools:oci_tool).
+[Plugin "oci"]
+OciTool = //tools/oci_tool
+DefaultPlatform = linux/amd64
+Registry = registry.example.com/team
+StructureTestTool = //third_party/binary:container-structure-test
+CosignTool = //third_party/binary:cosign
+SyftTool = //third_party/binary:syft
+ProvenanceBuildType = https://github.com/becomeliminal/oci-rules/image@v1
+
+[PluginDefinition]
+name = oci
+
+[PluginConfig "oci_tool"]
+ConfigKey = OciTool
+DefaultValue = //tools:oci_tool
+Help = The oci_tool executable every rule's action runs. Defaults to the released binary for the host, pinned by sha256 (tools/release.build_defs); //tools:oci_tool_<os>_<arch> is another platform's, for actions that run elsewhere.
+Inherit = true
+
+[PluginConfig "default_platform"]
+ConfigKey = DefaultPlatform
+Optional = true
+Help = The platform (linux/amd64 or linux/arm64) of an oci_image or oci_layer that names none. Unset, an oci_image must name its platform, and an oci_layer without one takes its files from the host's build.
+Inherit = true
+
+[PluginConfig "registry"]
+ConfigKey = Registry
+Optional = true
+Help = The registry a short repository is in (registry.example.com/team): repository = "app" is <Registry>/app. A repository whose first component is a registry host (it holds a "." or a ":", or is localhost) is used as given. Unset, a short repository is refused.
+Inherit = true
+
+[PluginConfig "structure_test_tool"]
+ConfigKey = StructureTestTool
+Optional = true
+Help = The container-structure-test executable oci_test runs, with its tar driver. Only oci_test needs it; a test without it fails at parse time naming this setting.
+Inherit = true
+
+[PluginConfig "cosign_tool"]
+ConfigKey = CosignTool
+Optional = true
+Help = The cosign executable. With it and SyftTool set, every oci_image and oci_image_index with a repository gets <name>_sign and <name>_verify.
+Inherit = true
+
+[PluginConfig "syft_tool"]
+ConfigKey = SyftTool
+Optional = true
+Help = The syft executable <name>_sign writes each image's SPDX SBOM with.
+Inherit = true
+
+[PluginConfig "signing_key"]
+ConfigKey = SigningKey
+Optional = true
+Help = The key <name>_sign signs with: a cosign key file or a KMS URI (gcpkms://..., awskms://...). Unset, signing is keyless, with the OIDC token of the environment it runs in.
+Inherit = true
+
+[PluginConfig "provenance_build_type"]
+ConfigKey = ProvenanceBuildType
+Optional = true
+Help = The buildType URI of the SLSA provenance <name>_sign attaches. Required with CosignTool.
+Inherit = true
+
+[PluginConfig "verify_public_key"]
+ConfigKey = VerifyPublicKey
+Optional = true
+Help = For key signing: the public key <name>_verify checks signatures against.
+Inherit = true
+
+[PluginConfig "verify_identity"]
+ConfigKey = VerifyIdentity
+Optional = true
+Help = For keyless signing: a regular expression the signing certificate's identity must match.
+Inherit = true
+
+[PluginConfig "verify_issuer"]
+ConfigKey = VerifyIssuer
+Optional = true
+Help = For keyless signing: the OIDC issuer the signing certificate must be from.
+Inherit = true
