@@ -27,8 +27,25 @@ jobs:
         runner: [ubuntu-24.04, macos-14]
     runs-on: ${{ matrix.runner }}
     name: test (${{ matrix.runner }})
+    env:
+      # One cache directory on Linux and macOS, outside the checkout, where
+      # the cache step restores it.
+      PLZ_ARGS: -o cache.dir:${{ github.workspace }}/../plz-cache
     steps:
       - uses: actions/checkout@v4
+
+      # Please's build cache and its own install, restored from the newest run
+      # on this OS and architecture and saved again after this one. Please's
+      # cache is keyed by each action's inputs, so a restored entry is only
+      # ever the output those inputs build: it saves time, and changes nothing.
+      - name: Restore Please's cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.please
+            ${{ github.workspace }}/../plz-cache
+          key: plz-${{ runner.os }}-${{ runner.arch }}-${{ github.sha }}
+          restore-keys: plz-${{ runner.os }}-${{ runner.arch }}-
 
       # Please's sandbox runs build actions in unprivileged user namespaces,
       # which Ubuntu 24.04's AppArmor refuses by default.
