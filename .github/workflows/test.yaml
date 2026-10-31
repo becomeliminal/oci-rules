@@ -27,12 +27,14 @@ jobs:
         runner: [ubuntu-24.04, macos-14]
     runs-on: ${{ matrix.runner }}
     name: test (${{ matrix.runner }})
-    env:
-      # One cache directory on Linux and macOS, outside the checkout, where
-      # the cache step restores it.
-      PLZ_ARGS: -o cache.dir:${{ github.workspace }}/../plz-cache
     steps:
       - uses: actions/checkout@v4
+
+      # One cache directory on Linux and macOS, in the runner's temp
+      # directory: actions/cache refuses paths with '..', and the runner
+      # context isn't available to a job's env.
+      - name: Point Please's cache at the runner's temp directory
+        run: echo "PLZ_ARGS=-o cache.dir:$RUNNER_TEMP/plz-cache" >> "$GITHUB_ENV"
 
       # Please's build cache and its own install, restored from the newest run
       # on this OS and architecture and saved again after this one. Please's
@@ -43,7 +45,7 @@ jobs:
         with:
           path: |
             ~/.please
-            ${{ github.workspace }}/../plz-cache
+            ${{ runner.temp }}/plz-cache
           key: plz-${{ runner.os }}-${{ runner.arch }}-${{ github.sha }}
           restore-keys: plz-${{ runner.os }}-${{ runner.arch }}-
 
