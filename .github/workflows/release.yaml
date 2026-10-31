@@ -26,6 +26,25 @@ jobs:
         with:
           ref: ${{ github.event.workflow_run.head_sha }}
 
+      # One cache directory on Linux and macOS, in the runner's temp
+      # directory: actions/cache refuses paths with '..', and the runner
+      # context isn't available to a job's env.
+      - name: Point Please's cache at the runner's temp directory
+        run: echo "PLZ_ARGS=-o cache.dir:$RUNNER_TEMP/plz-cache" >> "$GITHUB_ENV"
+
+      # Please's build cache and its own install, restored from the newest run
+      # on this OS and architecture and saved again after this one. Please's
+      # cache is keyed by each action's inputs, so a restored entry is only
+      # ever the output those inputs build: it saves time, and changes nothing.
+      - name: Restore Please's cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.please
+            ${{ runner.temp }}/plz-cache
+          key: plz-${{ runner.os }}-${{ runner.arch }}-${{ github.sha }}
+          restore-keys: plz-${{ runner.os }}-${{ runner.arch }}-
+
       # The binaries are the pinned ones or nothing is published: the test
       # compares each build with tools/release.build_defs.
       - name: Build oci_tool for every platform
